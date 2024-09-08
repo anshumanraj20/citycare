@@ -1,0 +1,160 @@
+name: Deploy Care Fe
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - develop
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: care_fe
+  AWS_DEFAULT_REGION: ap-south-1
+  AWS_DEFAULT_OUTPUT: json
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID}}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  EKS_CLUSTER_NAME: ${{ secrets.AWS_EKS_CLUSTER_NAME }}
+
+jobs:
+  test:
+    if: github.repository == 'ohcnetwork/care_fe'
+    runs-on: ubuntu-latest
+    name: Test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-test-${{ hashFiles('package-lock.json', 'Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-test-
+
+      - name: Test build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          provenance: false
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,mode=max,dest=/tmp/.buildx-cache-new
+
+      - name: Run tests
+        run: |
+          echo "running tests..."
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/staging' || startsWith(github.event.ref, 'refs/tags/v')
+    name: Build & Push to container registries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate docker tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/${{ github.event.repository.name }}
+          tags: |
+            type=raw,value=production-latest,enable=${{ startsWith(github.event.ref, 'refs/tags/v') }}
+            type=raw,value=production-latest-${{ github.run_number }}-{{date 'YYYYMMDD'}}-{{sha}},enable=${{ startsWith(github.event.ref, 'refs/tags/v') }}
+            type=raw,value=staging-latest,enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=staging-latest-${{ github.run_number }}-{{date 'YYYYMMDD'}}-{{sha}},enable=${{ github.ref == 'refs/heads/staging' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest-${{ github.run_number }},enable=${{ github.ref == 'refs/heads/develop' }}
+            type=semver,pattern={{version}}
+          flavor: |
+            latest=false
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-build-${{ hashFiles('package-lock.json', 'Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-build-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: false
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  notify-release:
+    needs: build
+    if: startsWith(github.event.ref, 'refs/tags/v')
+    name: Notify release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify release
+        run: |
+          echo "Release ${{ github.sha }} is ready to be deployed to production"
+
+  deploy-staging-gcp:
+    needs: build
+    if: github.ref == 'refs/heads/staging'
+    name: Deploy to staging GCP cluster
+    runs-on: ubuntu-latest
+    environment:
+      name: Staging-GCP
+      url: https://care-staging.ohc.network/
+    steps:
+      - name: Trigger deploy
+        run: |
+          COMMIT_SHA=${{ github.sha }}
+          JSON='{ "substitutions": { "care_be_tag":"", "care_fe_tag": "'"$COMMIT_SHA"'", "metabase_tag": "" } }'
+          curl --location "${{ secrets.STAGING_GCP_DEPLOY_URL }}" \
+            --header 'Content-Type: application/json' --data "$JSON"
